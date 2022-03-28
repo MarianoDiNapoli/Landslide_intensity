@@ -1,0 +1,177 @@
+setwd("private/CinqueTerre/") ## change path
+
+## Generate adjacency graph of slope units in file file adjgraph.txt
+library(maptools)
+SU=readShapeSpatial("SU_Monterosso_Vernazza_c2.shp") # 20m
+
+library(spdep)
+nb2INLA("adjgraph.txt",poly2nb(SU,queen=F,row.names=SU$su_id))
+
+## Load the data (landslide inventory and covariates)
+mydata=read.delim("5_Terre_c2_20m_lse.txt", header = TRUE, sep = "")
+
+## This operation ensures that any missing values coming from raster in GIs will be removed
+mydata[mydata==-9999 | mydata==-99999]=NA
+mydata = na.omit(mydata) #remove pixels with NA values (at the boundary of the study region)
+
+## Rescale the covariates in the same unitless scale. We opt here for a mean zero, unit variance rescaling
+data_scaled=mydata #create a copy of the original data frame
+vars2scale=c("slope","elevation","eastness","northness","plan_curv", "prof_curv","twi","rsp",
+             "dist_stream", "dist_trail_road")
+data_scaled[,vars2scale]=apply(data_scaled[,vars2scale],2,scale) 
+# Here we scale all continuous covariates (i.e., substract the mean and divide by the standard deviation)
+### The subsequent block defines certain parameters for the model
+y.count=mydata$slide_count # extract the landslide counts into a vector
+n.pixels=nrow(mydata) # number of pixels in the data set
+area.pixel=rep(20^2,n.pixels) 
+offset=area.pixel
+n.landslides=sum(y.count) # overall number of landslides
+avg.global=n.landslides/(n.pixels*area.pixel)  # average number of landslides per square meter
+
+### Create a dataset of pre-processed covariates
+library(INLA)
+covar.inla=data_scaled[,c("slope","elevation","eastness","northness","plan_curv", "prof_curv","twi","rsp","dist_stream",
+             "dist_trail_road", "land_use", "terrace", "geology", "su_id")]
+covar.inla=cbind(intercept=1,covar.inla)
+covar.inla$slope = inla.group(covar.inla$slope, n=20, method = "cut") # 20 classes
+
+###########################################
+######## COX POINT PROCESS IN INLA ########
+########        INTENSITY          ########
+###########################################
+library(matrixStats)
+
+hyper.rw = list(theta1 = list(prior="pc.prec", param=c(0.1, 0.5)))
+hyper.iid = list(theta1 = list(prior="pc.prec", param=c(0.1, 0.5)))
+hyper.fix = list(theta1 = list(initial = log(100), fixed = TRUE))
+hyper.Besag = list(theta1 = list(prior="pc.prec", param=c(0.04, 0.01)))
+my.init = NULL
+
+Xm = as.data.frame(covar.inla[ ,c("elevation","eastness","northness","plan_curv", "prof_curv","twi","rsp",
+                                  "dist_stream", "dist_trail_road")])
+Xm = as.matrix(Xm) 
+df = data.frame(y=y.count, intercept = 1, geology = covar.inla$geology, slope = covar.inla$slope, 
+                land_use = covar.inla$land_use, terrace = covar.inla$terrace,
+                su_id = covar.inla$su_id)
+
+formula.CinqueTerre = y~ -1 + intercept + Xm +
+  f(slope,model="rw1",hyper=hyper.rw, constr=T, scale.model = TRUE, diagonal = 1E-4)+
+  f(geology,model="iid",hyper=hyper.iid, constr=T)+
+  f(land_use,model="iid",hyper=hyper.iid, constr=T)+
+  f(terrace,model="iid",hyper=hyper.iid, constr=T)+
+  f(su_id, model="besag",graph="adjgraph.txt",hyper=hyper.Besag, 
+    constr=T,scale.model = TRUE, diagonal = 1E-4)
+
+Fit.CinqueTerre = inla(formula.CinqueTerre,family="poisson",data=c(as.list(df), list(Xm=Xm)),
+             control.fixed=list(prec=1),
+             E=offset,num.threads=2,
+             control.inla = list(int.strategy='eb'),
+             control.mode=list(restart=T, theta=my.init),
+             control.predictor=list(link = 1, compute = TRUE),
+             verbose = TRUE)
+
+#####################################################
+######## Fitting Extreme Value Distributions ########
+#####################################################
+
+library(MASS)
+dat = read.delim("D:/CinqueTerre/Submission/OpenData/LandslideArea@PXLlevel.txt")
+x = dat$area
+
+dgumbel = function(x, a, b) 1/b*exp((a-x)/b)*exp(-exp((a-x)/b))
+dinvgamma = function(x, a, b)b^a/gamma(a) * x^(-a-1) * exp(-b/x)
+ddpareto = function(x,mu,sigma,xi){ # asymmetric double type II Pareto: https://link.springer.com/article/10.1007/s42519-019-0080-5#rightslink
+  1/(2*sigma) * (1+xi*abs((x-mu)/sigma))^(-1/xi-1)
+}
+
+# inv Gamma (shape a, scale b. Mean defined for a>1)
+s2 = var(x)
+m = mean(x)
+a = 2 + s2/m^2
+b = m*(a-1)
+
+out.invG = fitdistr(x, dinvgamma, list(a = a, b = b))
+out.invG
+a.invG = out.invG$estimate[1]
+b.invG = out.invG$estimate[2]
+
+# Gumbel (location a, scale b. Mean is a + b*Euler)
+Euler = -digamma(1)
+
+s = sd(x)
+m = mean(x)
+b = s*sqrt(6)/pi
+a = m - b*Euler
+
+out.Gumbel = fitdistr(x, dgumbel, list(a = a, b = b))
+out.Gumbel
+a.gumbel = out.Gumbel$estimate[1]
+b.gumbel = out.Gumbel$estimate[2]
+mean.gumbel = a.gumbel + b.gumbel*Euler
+
+# Log-normal
+out.ln = fitdistr(x, "log-normal")
+meanlog = out.ln$estimate[1]
+sdlog = out.ln$estimate[2]
+
+# # Normal to log(x)
+# out.n = fitdistr(log(x), "normal")
+# mean.n = out.n$estimate[1]
+# sd.n = out.n$estimate[2]
+
+# Double Pareto
+out.dd = fitdistr(x, ddpareto, list(mu = 60, sigma = 60, xi = 0.5))
+mu.dd = out.dd$estimate[1]
+sigma.dd = out.dd$estimate[2]
+xi.dd = out.dd$estimate[3]
+
+# Plot an histogram and the estimated density
+all.out.invG    = paste('shape=', round(a.invG,2), '/ scale=', round(b.invG,2), '/ mean=Inf')
+all.out.gumbel  = paste('loc=', round(a.gumbel,2), '/ scale=', round(b.gumbel,2), '/ mean=', round(mean.gumbel,2))
+all.out.lnormal = paste('logmean=', round(meanlog,2), '/ logsd=', round(sdlog,2))
+all.out.dpareto = paste('loc=', round(mu.dd,2), '/ scale=', round(sigma.dd,2), '/ shape=', round(xi.dd,2), '/ mean=', round(mean.gumbel,2))
+
+par(mfrow = c(2,2))
+hist(x, prob = T, breaks = 30, ylim = c(0,0.008), main = 'Inv Gama')
+f1 = function(x) dinvgamma(x,a.invG,b.invG)
+f2 = function(x) dgumbel(x,a.gumbel,b.gumbel)
+f3 = function(x) dlnorm(x,meanlog,sdlog)
+f4 = function(x) ddpareto(x,mu.dd,sigma.dd,xi.dd)
+curve(f1, from = 0.001, to = 5000, col = 2, add = T, lwd = 2)
+legend('topright', all.out.invG)
+hist(x, prob = T, breaks = 30, ylim = c(0,0.008), main = 'Gumbel')
+curve(f2, from = 0.001, to = 5000, col = 3, add = T, lwd = 2)
+abline(v = mean.gumbel, col = 3, lwd = 2, lty = 2)
+legend('topright', all.out.gumbel)
+hist(x, prob = T, breaks = 30, ylim = c(0,0.008), main = 'LogNormal')
+curve(f3, from = 0.001, to = 5000, col = 4, add = T, lwd = 2)
+abline(v = (meanlog), col = 4, lwd = 2, lty = 2)
+legend('topright', all.out.lnormal)
+hist(x, prob = T, breaks = 30, ylim = c(0,0.008), main = 'AD Pareto')
+curve(f4, from = 0.001, to = 5000, col = 6, add = T, lwd = 2)
+abline(v = mean.gumbel, col = 6, lwd = 2, lty = 2)
+legend('topright', all.out.dpareto)
+dev.off()
+
+########################################################################
+######## From landslide intensity to area and density estimates ########
+########################################################################
+
+explo.mat <- data.frame(SU = mydata$su_id, obs = mydata$slide_count, 
+                        int = Fit.CinqueTerre$summary.fitted.values$mean*area.pixel)
+agg.obs <- aggregate(explo.mat$obs~explo.mat$SU, sum, data = explo.mat) #aggregate observed data for SU
+agg.fit <-  aggregate(explo.mat$int~explo.mat$SU, sum, data = explo.mat) # aggregate intensity data (fitted data) for SU
+plot(agg.obs$`explo.mat$obs`,agg.fit$`explo.mat$int`)
+
+SUlevel = read.delim("D:/CinqueTerre/Submission/OpenData/PostProcess@SUlevel.txt")
+
+dens.ObservedArea = density(SUlevel$Landslide_Area)
+dens.MeanArea = density(SUlevel$Landslides_Intensity*m)
+dens.AreaLogNorm = density(SUlevel$Landslides_Intensity*exp(meanlog))
+dens.AreaGumbel = density(SUlevel$Landslides_Intensity*mean.gumbel)
+
+plot(dens.ObservedArea$x, dens.ObservedArea$y/max(dens.ObservedArea$y),
+     xlab = "Landslide Area per SU", type = "l", lwd = 2)
+lines(dens.MeanArea$x, dens.MeanArea$y/max(dens.MeanArea$y), col = "red", lwd = 2)
+lines(dens.AreaLogNorm$x, dens.AreaLogNorm$y/max(dens.AreaLogNorm$y), col = "green", lwd = 2)
+lines(dens.AreaGumbel$x, dens.AreaGumbel$y/max(dens.AreaGumbel$y), col = "blue", lwd = 2)
